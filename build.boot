@@ -6,7 +6,8 @@
                     [org.clojure/tools.namespace "0.2.11" :scope "test"]
 
                     ; dependencies
-                    [com.taoensso/timbre "4.10.0"]])
+                    [com.taoensso/timbre "4.10.0"]
+                    [com.jsyn/jsyn       "20170328"]])
 
 (require '[adzerk.bootlaces :refer :all])
 

@@ -4,15 +4,33 @@
                                      pdoseq-block
                                      parse-position)]
             [taoensso.timbre :as    log])
-  (:import [javax.sound.midi
+  (:import [com.softsynth.shared.time TimeStamp ScheduledCommand]
+           [com.jsyn.engine SynthesisEngine]
+           [javax.sound.midi
             Sequence MidiSystem MidiDevice
             ShortMessage Synthesizer MetaMessage]
-           [java.io File]))
+           [java.io File]
+           ))
+
+(def ^:dynamic *synthesis-engine* nil)
+
+;; FIXME workers don't die properly when true?
+;; TODO set this to nil
+(def ^:dynamic *use-midi-sequencer* true)
+
+(defn new-synthesis-engine
+  []
+  (doto (SynthesisEngine.) .start))
+
+(defn start-synthesis-engine!
+  []
+  (alter-var-root #'*synthesis-engine* (constantly (new-synthesis-engine))))
 
 (defn new-audio-context
   []
   (atom
-    {:audio-types #{}}))
+    {:audio-types      #{}
+     :synthesis-engine (or *synthesis-engine* (new-synthesis-engine))}))
 
 (defn set-up?
   [{:keys [audio-context] :as score} audio-type]
@@ -96,6 +114,9 @@
 
    Playback may not necessarily be resumed after doing this."
   ([{:keys [audio-context] :as score}]
+   ;; Prevent any future events from being executed. This is so that playback
+   ;; will stop when we tear down the score mid-playback.
+   (some-> @audio-context :synthesis-engine .clearCommandQueue)
    ;; Do any necessary clean-up for each audio type.
    ;; e.g. for MIDI, close the MidiSynthesizer.
    (tear-down! score (determine-audio-types score)))
@@ -127,6 +148,7 @@
 (defn stop-playback!
   "Stop playback, but leave the score in a state where playback can be resumed."
   ([{:keys [audio-context] :as score}]
+   (some-> @audio-context :synthesis-engine .clearCommandQueue)
    (stop-playback! score (determine-audio-types score)))
   ([{:keys [audio-context] :as score} audio-type]
    (if (coll? audio-type)
@@ -241,6 +263,37 @@
                    events)
          (sort-by :offset))))
 
+(defn schedule-event!
+  [^SynthesisEngine engine offset f]
+  (let [ts  (TimeStamp. offset)
+        cmd (proxy [ScheduledCommand] [] (run [] (f)))]
+    (.scheduleCommand engine ts cmd)))
+
+(defn schedule-events!
+  [events score playing? wait]
+  (let [{:keys [instruments audio-context]} score
+        engine (:synthesis-engine @audio-context)
+        begin  (.getCurrentTime ^SynthesisEngine engine)
+        end!   #(deliver wait :done)]
+    (pdoseq-block [{:keys [offset instrument duration] :as event} events]
+      (let [inst   (-> instrument instruments)
+            start! #(when @playing?
+                      (if-let [f (:function event)]
+                        (future (f))
+                        (start-event! audio-context event inst)))
+            stop!  #(when-not (:function event)
+                      (stop-event! audio-context event inst))]
+        (schedule-event! engine (+ begin
+                                   (/ offset 1000.0)) start!)
+        (when-not (:function event)
+          (schedule-event! engine (+ begin
+                                     (/ offset 1000.0)
+                                     (/ duration 1000.0)) stop!))))
+    (schedule-event! engine (+ begin
+                               (/ (score-length events) 1000.0)
+                               1) end!)))
+
+
 (defn score-to-sequence
   [events score]
   (let [{:keys [instruments audio-context]} score
@@ -289,15 +342,13 @@
       .close)
     seq))
 
-(defn create-sequence!
-  [score & [event-set]]
-  (let [score       (update score :audio-context #(or % (new-audio-context)))
-        _           (log/debug "Setting up audio types...")
-        _           (set-up! score)
-        _           (refresh! score)
-        _           (log/debug "Determining events to schedule...")
-        _           (log/debug (str "*play-opts*: " *play-opts*))
-        [start end] (start-finish-times *play-opts* (:markers score))
+(defn create-events! [score event-set]
+  (log/debug "Setting up audio types...")
+  (set-up! score)
+  (refresh! score)
+  (log/debug "Determining events to schedule...")
+  (log/debug (str "*play-opts*: " *play-opts*))
+  (let [[start end] (start-finish-times *play-opts* (:markers score))
         start'      (cond
                       ;; If a "from" offset is explicitly provided, use the
                       ;; calculated start offset derived from it.
@@ -310,9 +361,14 @@
                       (earliest-offset event-set)
 
                       :else
-                      start)
-        events      (-> (or event-set (:events score))
-                        (shift-events start' end))]
+                      start)]
+    (-> (or event-set (:events score))
+        (shift-events start' end))))
+
+(defn create-sequence!
+  [score & [event-set]]
+  (let [score       (update score :audio-context #(or % (new-audio-context)))
+        events      (create-events! score event-set)]
     (score-to-sequence events score)))
 
 (defn export-midi!
@@ -340,20 +396,31 @@
      :wait     A function that will sleep for the duration of the score. This is
                useful if you want to playback asynchronously, perform some
                actions, then wait until playback is complete before proceeding."
-  [score & args]
+  [score & [event-set]]
   (let [{:keys [one-off? async?]} *play-opts*
         _           (log/debug "Determining audio types...")
         score       (update score :audio-context #(or % (new-audio-context)))
-        sequence    (apply create-sequence! score args)
+        playing?    (atom true)
         wait        (promise)]
     (log/debug "Scheduling events...")
-    (midi/play-sequence! (:audio-context score) sequence #(deliver wait :done))
-    (cond
-      (and one-off? async?)       (future @wait (tear-down! score))
-      (and one-off? (not async?)) (do @wait (tear-down! score))
-      (not async?)                @wait)
+    (if *use-midi-sequencer*
+      ;; play with midi sequencer
+      (midi/play-sequence!
+        (:audio-content score)
+        (create-sequence! score event-set)
+        #(deliver wait :done))
+      ;; play with jsyn
+      (do
+        (-> (create-events! score event-set)
+            (schedule-events! score playing? wait))
+        (cond
+          (and one-off? async?)       (future @wait (tear-down! score))
+          (and one-off? (not async?)) (do @wait (tear-down! score))
+          (not async?)                @wait)))
     {:score score
-     :stop! #(if one-off?
-               (tear-down! score)
-               (stop-playback! score))
+     :stop! #(do
+               (reset! playing? false)
+               (if one-off?
+                 (tear-down! score)
+                 (stop-playback! score)))
      :wait  #(deref wait)}))
