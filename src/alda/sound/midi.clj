@@ -12,8 +12,12 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defn new-midi-synth
-  []
-  (doto ^Synthesizer (MidiSystem/getSynthesizer) .open))
+  ([]
+   (new-midi-synth true))
+  ([open?]
+   (let [^Synthesizer synth (MidiSystem/getSynthesizer)]
+     (when open? (.open synth))
+     synth)))
 
 (defn new-midi-sequencer
   []
@@ -70,7 +74,7 @@
   (if *midi-synth*
     (do
       (log/debug "Using the global *midi-synth*")
-      (doto *midi-synth* .open))
+      *midi-synth*)
     (do
       (fill-midi-synth-pool!)
       (drain-excess-midi-synths!)
