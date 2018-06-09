@@ -30,7 +30,8 @@
   []
   (atom
     {:audio-types      #{}
-     :synthesis-engine (or *synthesis-engine* (new-synthesis-engine))}))
+     :synthesis-engine (when-not *use-midi-sequencer*
+                         (or *synthesis-engine* (new-synthesis-engine)))}))
 
 (defn set-up?
   [{:keys [audio-context] :as score} audio-type]
