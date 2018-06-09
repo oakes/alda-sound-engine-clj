@@ -406,7 +406,7 @@
     (if *use-midi-sequencer*
       ;; play with midi sequencer
       (midi/play-sequence!
-        (:audio-content score)
+        (:audio-context score)
         (create-sequence! score event-set)
         #(deliver wait :done))
       ;; play with jsyn
